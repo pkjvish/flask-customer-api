@@ -1,0 +1,60 @@
+{
+  "family": "customer-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/customer-api-task-execution-role",
+  "taskRoleArn":      "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/customer-api-task-role",
+
+  "containerDefinitions": [
+    {
+      "name":      "customer-api",
+      "image":     "ACCOUNT_ID_PLACEHOLDER.dkr.ecr.REGION_PLACEHOLDER.amazonaws.com/customer-api:latest",
+      "essential": true,
+
+      "portMappings": [
+        { "containerPort": 5000, "protocol": "tcp" }
+      ],
+
+      "environment": [
+        { "name": "FLASK_ENV",   "value": "production" },
+        { "name": "DB_PORT",     "value": "3306" },
+        { "name": "DB_NAME",     "value": "customerdb" }
+      ],
+
+      "secrets": [
+        {
+          "name":      "DB_HOST",
+          "valueFrom": "arn:aws:ssm:REGION_PLACEHOLDER:ACCOUNT_ID_PLACEHOLDER:parameter/customer-api/DB_HOST"
+        },
+        {
+          "name":      "DB_USER",
+          "valueFrom": "arn:aws:ssm:REGION_PLACEHOLDER:ACCOUNT_ID_PLACEHOLDER:parameter/customer-api/DB_USER"
+        },
+        {
+          "name":      "DB_PASSWORD",
+          "valueFrom": "arn:aws:ssm:REGION_PLACEHOLDER:ACCOUNT_ID_PLACEHOLDER:parameter/customer-api/DB_PASSWORD"
+        }
+      ],
+
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group":         "/ecs/customer-api",
+          "awslogs-region":        "REGION_PLACEHOLDER",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+
+      "healthCheck": {
+        "command":     ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"],
+        "interval":    30,
+        "timeout":     5,
+        "retries":     3,
+        "startPeriod": 15
+      }
+    }
+  ]
+}

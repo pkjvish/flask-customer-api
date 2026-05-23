@@ -1,0 +1,709 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Complete AWS infrastructure for the Flask Customer CRUD API.
+  Creates in one command:
+    - VPC with 2 public subnets across 2 Availability Zones
+    - 2 private subnets for RDS (DB must not be public-facing)
+    - Internet Gateway + Route Tables
+    - Security Groups (ALB, ECS tasks, RDS)
+    - Amazon RDS MySQL 8 (db.t3.micro — free-tier eligible)
+    - ECR repository for Docker images
+    - ECS Fargate cluster, task definition, and service
+    - Application Load Balancer (port 80 → ECS port 5000)
+    - CloudWatch Log Group (30-day retention)
+    - IAM roles: ECS task execution, ECS task, GitHub Actions deployer
+    - SSM Parameter Store entries for DB credentials
+    - IAM access key for GitHub Actions (output at stack creation time)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETERS — only values you need to fill in before deploying
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: customer-api
+    Description: >
+      Prefix used for every resource name.
+      Use lowercase letters and hyphens only.
+
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+
+  # ── Networking CIDRs ────────────────────────────────────────────────────────
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: IP range for the whole VPC.
+
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: Public subnet in AZ-1 (ALB + ECS tasks live here).
+
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: Public subnet in AZ-2 (ALB requires 2 AZs).
+
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: Private subnet in AZ-1 (RDS primary lives here).
+
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: Private subnet in AZ-2 (RDS Multi-AZ standby / subnet group).
+
+  # ── RDS settings ────────────────────────────────────────────────────────────
+  DBName:
+    Type: String
+    Default: customerdb
+    Description: Name of the MySQL database.
+
+  DBUsername:
+    Type: String
+    Default: appadmin
+    NoEcho: false
+    Description: Master username for RDS MySQL.
+
+  DBPassword:
+    Type: String
+    NoEcho: true          # value is masked in the CloudFormation console
+    MinLength: 8
+    MaxLength: 41
+    Description: >
+      Master password for RDS MySQL.
+      Must be 8-41 characters. IMPORTANT: choose a strong password.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+    Description: RDS instance type. db.t3.micro is free-tier eligible.
+
+  # ── ECS sizing ──────────────────────────────────────────────────────────────
+  TaskCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024", "2048"]
+    Description: Fargate CPU units (256 = 0.25 vCPU).
+
+  TaskMemory:
+    Type: String
+    Default: "512"
+    AllowedValues: ["512", "1024", "2048", "4096"]
+    Description: Fargate memory in MB.
+
+  DesiredTaskCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of ECS tasks to run.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 1 — NETWORKING
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── VPC ─────────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+
+  # ── Internet Gateway ─────────────────────────────────────────────────────────
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ── Public Subnets (ALB + ECS tasks) ────────────────────────────────────────
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet-2"
+
+  # ── Private Subnets (RDS — never exposed to internet) ───────────────────────
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-2"
+
+  # ── Public Route Table (0.0.0.0/0 → Internet Gateway) ──────────────────────
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-rt"
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private subnets use the default (implicit) route table — no internet route.
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 2 — SECURITY GROUPS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── ALB Security Group ───────────────────────────────────────────────────────
+  #    Internet → ALB on port 80 only
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-alb-sg"
+      GroupDescription: Allow HTTP from the internet to the ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from public internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound allowed
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-alb-sg"
+
+  # ── ECS Task Security Group ──────────────────────────────────────────────────
+  #    Only the ALB can reach ECS tasks on port 5000.
+  #    Tasks can reach internet outbound (to pull ECR images, write CW logs).
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-ecs-sg"
+      GroupDescription: Allow port 5000 from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Flask API port from ALB only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound (ECR pull, CloudWatch, RDS)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ecs-sg"
+
+  # ── RDS Security Group ───────────────────────────────────────────────────────
+  #    Only ECS tasks can connect to MySQL on port 3306.
+  #    RDS is in private subnets — completely unreachable from internet.
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-rds-sg"
+      GroupDescription: Allow MySQL 3306 from ECS tasks only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+          Description: MySQL from ECS tasks only
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-rds-sg"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 3 — RDS MYSQL
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # RDS needs a "subnet group" — a named collection of private subnets
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${ProjectName}-rds-subnet-group"
+      DBSubnetGroupDescription: Private subnets for RDS MySQL
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-rds-subnet-group"
+
+  # MySQL 8 RDS instance (db.t3.micro — Free Tier eligible for 12 months)
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot    # takes a final snapshot before delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-mysql"
+      DBName: !Ref DBName
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: "8.0"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: "20"    # GB — minimum for gp2
+      StorageType: gp2
+      MultiAZ: false            # set true for production HA (costs 2x)
+      PubliclyAccessible: false # RDS stays private — accessed only by ECS
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      BackupRetentionPeriod: 7  # days
+      DeletionProtection: false # set true when you go live to prevent accidents
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-mysql"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 4 — SSM PARAMETER STORE  (DB credentials stored securely)
+  #
+  # ECS pulls these at container startup via the "secrets" block in the task
+  # definition, so they are NEVER in plaintext in environment variables or logs.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  SSMParamDBHost:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/DB_HOST"
+      Type: String
+      Value: !GetAtt RDSInstance.Endpoint.Address
+      Description: RDS MySQL endpoint hostname
+
+  SSMParamDBUser:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/DB_USER"
+      Type: String
+      Value: !Ref DBUsername
+      Description: RDS master username
+
+  SSMParamDBPassword:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/DB_PASSWORD"
+      Type: String          # use SecureString manually via Console/CLI after deploy
+      Value: !Ref DBPassword
+      Description: RDS master password
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 5 — ECR REPOSITORY
+  # ════════════════════════════════════════════════════════════════════════════
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      ImageScanningConfiguration:
+        ScanOnPush: true        # free vulnerability scan on every docker push
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep only 10 most recent images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ecr"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 6 — IAM ROLES
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── ECS Task Execution Role ──────────────────────────────────────────────────
+  # Used by the ECS AGENT (not your app) to:
+  #   • pull Docker images from ECR
+  #   • write container logs to CloudWatch
+  #   • read secrets from SSM Parameter Store
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-task-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*"
+
+  # ── ECS Task Role ────────────────────────────────────────────────────────────
+  # Used by YOUR APPLICATION CODE inside the container.
+  # Add more policies here if your app needs S3, SES, SQS, etc.
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # ── GitHub Actions Deployer User ─────────────────────────────────────────────
+  # Least-privilege: only what CI/CD needs — nothing more.
+  GitHubActionsUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${ProjectName}-github-deployer"
+      Policies:
+        - PolicyName: ECRPushAndECSDeploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ECR: authenticate and push images
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: "*"
+              # ECS: register new task definition, update service
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                  - ecs:DescribeClusters
+                Resource: "*"
+              # IAM: allow passing roles to ECS tasks
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt ECSTaskExecutionRole.Arn
+                  - !GetAtt ECSTaskRole.Arn
+
+  # Access key for the GitHub Actions user
+  GitHubActionsAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref GitHubActionsUser
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 7 — CLOUDWATCH
+  # ════════════════════════════════════════════════════════════════════════════
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 8 — ECS CLUSTER + TASK DEFINITION + SERVICE
+  # ════════════════════════════════════════════════════════════════════════════
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-cluster"
+
+  # The task definition uses a placeholder image.
+  # GitHub Actions will replace it with the real ECR image on first deployment.
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ProjectName
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ProjectName
+          # Placeholder: GitHub Actions will swap this for your ECR image URI
+          Image: public.ecr.aws/docker/library/python:3.12-slim
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5000
+              Protocol: tcp
+          Environment:
+            - Name: FLASK_ENV
+              Value: !Ref EnvironmentName
+            - Name: DB_PORT
+              Value: "3306"
+            - Name: DB_NAME
+              Value: !Ref DBName
+          Secrets:
+            - Name: DB_HOST
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/DB_HOST"
+            - Name: DB_USER
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/DB_USER"
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/DB_PASSWORD"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command: [CMD-SHELL, "curl -f http://localhost:5000/health || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 15
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-task-def"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SECTION 9 — APPLICATION LOAD BALANCER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-alb"
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-tg"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ── ECS Service ──────────────────────────────────────────────────────────────
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-service"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref DesiredTaskCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ProjectName
+          ContainerPort: 5000
+          TargetGroupArn: !Ref ALBTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-service"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUTS — values you need after the stack is created
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  # ── STEP A: Copy these two into GitHub Secrets ──────────────────────────────
+  GitHubActionsAccessKeyId:
+    Description: >
+      GitHub Secret name: AWS_ACCESS_KEY_ID
+      Go to: GitHub repo → Settings → Secrets and variables → Actions → New secret
+    Value: !Ref GitHubActionsAccessKey
+
+  GitHubActionsSecretAccessKey:
+    Description: >
+      GitHub Secret name: AWS_SECRET_ACCESS_KEY
+      Save this immediately — it cannot be retrieved again after the stack is created.
+    Value: !GetAtt GitHubActionsAccessKey.SecretAccessKey
+
+  # ── STEP B: Copy these into deploy.yml env block ────────────────────────────
+  ECSClusterName:
+    Description: "deploy.yml → env.ECS_CLUSTER"
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub "${ProjectName}-cluster-name"
+
+  ECSServiceName:
+    Description: "deploy.yml → env.ECS_SERVICE"
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub "${ProjectName}-service-name"
+
+  ECRRepositoryName:
+    Description: "deploy.yml → env.ECR_REPOSITORY"
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub "${ProjectName}-ecr-name"
+
+  ECRRepositoryURI:
+    Description: Full ECR URI (AccountId.dkr.ecr.region.amazonaws.com/repo-name)
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}"
+    Export:
+      Name: !Sub "${ProjectName}-ecr-uri"
+
+  AWSRegion:
+    Description: "deploy.yml → env.AWS_REGION"
+    Value: !Ref AWS::Region
+
+  # ── STEP C: Update ecs-task-definition.json ──────────────────────────────────
+  AccountId:
+    Description: "Replace ACCOUNT_ID_PLACEHOLDER in ecs-task-definition.json"
+    Value: !Ref AWS::AccountId
+
+  Region:
+    Description: "Replace REGION_PLACEHOLDER in ecs-task-definition.json"
+    Value: !Ref AWS::Region
+
+  # ── STEP D: Verify deployment ───────────────────────────────────────────────
+  LoadBalancerURL:
+    Description: >
+      Public URL of your Customer API.
+      Available ~2 minutes after first ECS task becomes healthy.
+      Test: curl http://<this-url>/health
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+    Export:
+      Name: !Sub "${ProjectName}-alb-url"
+
+  RDSEndpoint:
+    Description: RDS MySQL hostname (also stored in SSM Parameter Store)
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${ProjectName}-rds-endpoint"

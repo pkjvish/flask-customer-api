@@ -1,0 +1,64 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local development stack
+#   mysql  → MySQL 8 database
+#   api    → Flask customer API (auto-reloads on code changes)
+#
+# Usage:
+#   docker compose up --build          # start everything
+#   docker compose down -v             # stop and wipe volumes
+#   docker compose logs -f api         # follow API logs
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── MySQL 8 ────────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: customer-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE:      customerdb
+      MYSQL_USER:          appuser
+      MYSQL_PASSWORD:      apppassword
+    ports:
+      - "3306:3306"           # expose to host so you can use MySQL Workbench
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
+             "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Flask API ───────────────────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: customer-api
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      DB_HOST:     mysql
+      DB_PORT:     3306
+      DB_NAME:     customerdb
+      DB_USER:     appuser
+      DB_PASSWORD: apppassword
+      FLASK_ENV:   development
+    depends_on:
+      mysql:
+        condition: service_healthy   # wait until MySQL is ready
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  mysql_data:
+    driver: local

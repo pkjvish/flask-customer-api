@@ -1,0 +1,117 @@
+name: CI/CD → ECR → ECS (Customer API)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIGGERS
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENVIRONMENT VARIABLES
+# Update these four values to match your CloudFormation stack Outputs.
+# All AWS credentials come from GitHub Secrets (never hard-code them).
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  AWS_REGION:      us-east-1           # ← same region you deployed CloudFormation
+  ECR_REPOSITORY:  customer-api        # ← must match ProjectName in CloudFormation
+  ECS_CLUSTER:     customer-api-cluster   # ← from CloudFormation Output: ECSClusterName
+  ECS_SERVICE:     customer-api-service   # ← from CloudFormation Output: ECSServiceName
+  CONTAINER_NAME:  customer-api        # ← must match ProjectName in CloudFormation
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Unit tests (runs on every push and PR)
+  # ───────────────────────────────────────────────────────────────────────────
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Build Docker image, push to ECR, deploy to ECS
+  #          Only runs on push to main (not on PRs)
+  # ───────────────────────────────────────────────────────────────────────────
+  build-and-deploy:
+    name: Build → Push to ECR → Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      # ── Step 1: Checkout ───────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Step 2: Configure AWS credentials from GitHub Secrets ──────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # ── Step 3: Log in to Amazon ECR ───────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Step 4: Build Docker image and push to ECR ─────────────────────────
+      #    Tagged with both the git SHA (immutable) and "latest" (mutable)
+      - name: Build, tag, and push Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG:    ${{ github.sha }}
+        run: |
+          echo "Building image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ── Step 5: Render a new ECS task definition with the new image URI ────
+      #    This reads ecs-task-definition.json, replaces the image field,
+      #    and writes a temp file for the deploy step.
+      - name: Render new ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ecs-task-definition.json
+          container-name:  ${{ env.CONTAINER_NAME }}
+          image:           ${{ steps.build-image.outputs.image }}
+
+      # ── Step 6: Register new task definition revision and update service ───
+      #    wait-for-service-stability = true means the workflow stays green
+      #    only after the new task is actually RUNNING and healthy.
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:          ${{ steps.task-def.outputs.task-definition }}
+          service:                  ${{ env.ECS_SERVICE }}
+          cluster:                  ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
