@@ -15,7 +15,7 @@ on:
 # All AWS credentials come from GitHub Secrets (never hard-code them).
 # ─────────────────────────────────────────────────────────────────────────────
 env:
-  AWS_REGION:      us-east-1           # ← same region you deployed CloudFormation
+  AWS_REGION:      ap-south-1           # ← same region you deployed CloudFormation
   ECR_REPOSITORY:  customer-api        # ← must match ProjectName in CloudFormation
   ECS_CLUSTER:     customer-api-cluster   # ← from CloudFormation Output: ECSClusterName
   ECS_SERVICE:     customer-api-service   # ← from CloudFormation Output: ECSServiceName
