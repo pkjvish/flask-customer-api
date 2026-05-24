@@ -13,21 +13,53 @@ Routes:
 from flask import Flask, request, jsonify
 from db import get_db, init_db, init_app
 import logging
+import time
+import os
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ── Logging setup — JSON-style lines so CloudWatch Insights can query them ──
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "msg": %(message)s}',
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+logger = logging.getLogger("customer-api")
 
 app = Flask(__name__)
 init_app(app)
 
 
-# ── Bootstrap ────────────────────────────────────────────────────────────────
+# ── Startup ──────────────────────────────────────────────────────────────────
+
+logger.info('"app starting — reading env config"')
+logger.info('"DB_HOST=%s DB_NAME=%s DB_USER=%s"',
+            os.environ.get("DB_HOST", "NOT SET"),
+            os.environ.get("DB_NAME", "NOT SET"),
+            os.environ.get("DB_USER", "NOT SET"))
 
 with app.app_context():
     try:
+        logger.info('"attempting DB init"')
         init_db()
+        logger.info('"DB init successful"')
     except Exception as e:
-        logger.warning("DB init deferred: %s", e)
+        logger.warning('"DB init deferred: %s"', e)
+
+
+# ── Request / response logging ───────────────────────────────────────────────
+
+@app.before_request
+def log_request():
+    request._start_time = time.time()
+    logger.info('"incoming request" method="%s" path="%s" remote_addr="%s"',
+                request.method, request.path, request.remote_addr)
+
+
+@app.after_request
+def log_response(response):
+    duration_ms = round((time.time() - getattr(request, "_start_time", time.time())) * 1000, 2)
+    logger.info('"response" method="%s" path="%s" status=%s duration_ms=%s',
+                request.method, request.path, response.status_code, duration_ms)
+    return response
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -63,8 +95,9 @@ def health():
         db = get_db()
         db.execute("SELECT 1")
         db_status = "connected"
+        logger.info('"health check passed — DB connected"')
     except Exception as exc:
-        logger.warning("DB health check failed: %s", exc)
+        logger.warning('"health check — DB unavailable: %s"', exc)
         db_status = "unavailable"
     # Always return 200 — ECS health check must not fail due to DB
     return jsonify({"status": "healthy", "service": "customer-api",
@@ -75,10 +108,12 @@ def health():
 
 @app.route("/api/v1/customers", methods=["GET"])
 def list_customers():
+    logger.info('"list_customers called"')
     try:
         page  = max(int(request.args.get("page",  1)), 1)
         limit = min(int(request.args.get("limit", 10)), 100)
     except ValueError:
+        logger.warning('"list_customers — invalid pagination params"')
         return jsonify({"error": "page and limit must be integers"}), 400
 
     offset = (page - 1) * limit
@@ -103,8 +138,10 @@ def list_customers():
 
 @app.route("/api/v1/customers", methods=["POST"])
 def create_customer():
+    logger.info('"create_customer called"')
     data = request.get_json(silent=True)
     if not data:
+        logger.warning('"create_customer — missing or invalid JSON body"')
         return jsonify({"error": "Request body must be valid JSON"}), 400
 
     err = _validate_required(data, ["first_name", "last_name", "email"])
@@ -118,6 +155,7 @@ def create_customer():
         "SELECT id FROM customers WHERE email = %s", (data["email"],)
     ).fetchone()
     if existing:
+        logger.warning('"create_customer — duplicate email: %s"', data["email"])
         return jsonify({"error": f"Email '{data['email']}' is already registered"}), 409
 
     cursor = db.execute(
@@ -136,6 +174,7 @@ def create_customer():
     db.commit()
 
     new_id = cursor.lastrowid
+    logger.info('"create_customer — created id=%s"', new_id)
     row    = db.execute("SELECT * FROM customers WHERE id = %s", (new_id,)).fetchone()
     return jsonify(_customer_row_to_dict(row)), 201
 
@@ -253,17 +292,19 @@ def delete_customer(customer_id):
 
 @app.errorhandler(404)
 def not_found(_):
+    logger.warning('"404 — endpoint not found: %s %s"', request.method, request.path)
     return jsonify({"error": "Endpoint not found"}), 404
 
 
 @app.errorhandler(405)
 def method_not_allowed(_):
+    logger.warning('"405 — method not allowed: %s %s"', request.method, request.path)
     return jsonify({"error": "Method not allowed"}), 405
 
 
 @app.errorhandler(500)
 def internal_error(exc):
-    logger.error("Unhandled exception: %s", exc)
+    logger.error('"500 — unhandled exception: %s"', exc, exc_info=True)
     return jsonify({"error": "Internal server error"}), 500
 
 

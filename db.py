@@ -13,6 +13,9 @@ import os
 import pymysql
 import pymysql.cursors
 from flask import g
+import logging
+
+logger = logging.getLogger("customer-api.db")
 
 # ── Connection settings from environment ────────────────────────────────────
 
@@ -34,7 +37,13 @@ DB_CONFIG = {
 def get_db():
     """Return the request-scoped MySQL connection, creating it if needed."""
     if "db" not in g:
-        g.db = pymysql.connect(**DB_CONFIG)
+        logger.info('"opening DB connection to %s"', DB_CONFIG["host"])
+        try:
+            g.db = pymysql.connect(**DB_CONFIG)
+            logger.info('"DB connection established"')
+        except Exception as e:
+            logger.error('"DB connection failed: %s"', e)
+            raise
     return g.db
 
 
@@ -43,6 +52,7 @@ def close_db(error=None):
     db = g.pop("db", None)
     if db is not None:
         db.close()
+        logger.info('"DB connection closed"')
 
 
 # ── Schema bootstrap ─────────────────────────────────────────────────────────
@@ -69,12 +79,16 @@ CREATE TABLE IF NOT EXISTS customers (
 
 def init_db():
     """Create the customers table if it does not already exist."""
+    logger.info('"init_db: connecting to host=%s"', DB_CONFIG["host"])
     db = get_db()
     with db.cursor() as cur:
+        logger.info('"init_db: creating database if not exists"')
         cur.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_CONFIG['database']}`")
         cur.execute(f"USE `{DB_CONFIG['database']}`")
+        logger.info('"init_db: running DDL"')
         cur.execute(DDL)
     db.commit()
+    logger.info('"init_db: complete"')
 
 
 # ── Register teardown on the Flask app ──────────────────────────────────────
