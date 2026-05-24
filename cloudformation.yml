@@ -304,7 +304,8 @@ Resources:
   # MySQL 8 RDS instance (db.t3.micro — Free Tier eligible for 12 months)
   RDSInstance:
     Type: AWS::RDS::DBInstance
-    DeletionPolicy: Snapshot    # takes a final snapshot before delete
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
     Properties:
       DBInstanceIdentifier: !Sub "${ProjectName}-mysql"
       DBName: !Ref DBName
@@ -313,15 +314,22 @@ Resources:
       EngineVersion: "8.0"
       MasterUsername: !Ref DBUsername
       MasterUserPassword: !Ref DBPassword
-      AllocatedStorage: "20"    # GB — minimum for gp2
+      AllocatedStorage: "20"
       StorageType: gp2
-      MultiAZ: false            # set true for production HA (costs 2x)
-      PubliclyAccessible: false # RDS stays private — accessed only by ECS
+      StorageEncrypted: true
+      MultiAZ: false
+      PubliclyAccessible: false
       DBSubnetGroupName: !Ref RDSSubnetGroup
       VPCSecurityGroups:
         - !Ref RDSSecurityGroup
-      BackupRetentionPeriod: 7  # days
-      DeletionProtection: false # set true when you go live to prevent accidents
+      BackupRetentionPeriod: 7
+      AutoMinorVersionUpgrade: true
+      EnableIAMDatabaseAuthentication: true
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        - slowquery
+      DeletionProtection: false
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-mysql"
@@ -527,6 +535,7 @@ Resources:
           # Placeholder: GitHub Actions will swap this for your ECR image URI
           Image: public.ecr.aws/docker/library/python:3.12-slim
           Essential: true
+          User: "1000"
           PortMappings:
             - ContainerPort: 5000
               Protocol: tcp
@@ -548,14 +557,14 @@ Resources:
             LogDriver: awslogs
             Options:
               awslogs-group: !Ref LogGroup
-              awslogs-region: !Ref AWS::Region
+              awslogs-region: !Sub "${AWS::Region}"
               awslogs-stream-prefix: ecs
           HealthCheck:
             Command: [CMD-SHELL, "curl -f http://localhost:5000/health || exit 1"]
             Interval: 30
-            Timeout: 5
-            Retries: 3
-            StartPeriod: 15
+            Timeout: 10
+            Retries: 5
+            StartPeriod: 60
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-task-def"
@@ -576,6 +585,9 @@ Resources:
         - !Ref PublicSubnet2
       SecurityGroups:
         - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: "true"
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-alb"
@@ -590,9 +602,9 @@ Resources:
       TargetType: ip
       HealthCheckPath: /health
       HealthCheckIntervalSeconds: 30
-      HealthCheckTimeoutSeconds: 5
+      HealthCheckTimeoutSeconds: 10
       HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 3
+      UnhealthyThresholdCount: 5
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-tg"

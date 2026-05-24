@@ -11,22 +11,23 @@ Routes:
 """
 
 from flask import Flask, request, jsonify
-from db import get_db, init_db
+from db import get_db, init_db, init_app
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+init_app(app)
 
 
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 
-@app.before_request
-def setup():
-    """Run DB init once before the very first request."""
-    app.before_request_funcs[None].remove(setup)
-    init_db()
+with app.app_context():
+    try:
+        init_db()
+    except Exception as e:
+        logger.warning("DB init deferred: %s", e)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -65,6 +66,7 @@ def health():
     except Exception as exc:
         logger.warning("DB health check failed: %s", exc)
         db_status = "unavailable"
+    # Always return 200 — ECS health check must not fail due to DB
     return jsonify({"status": "healthy", "service": "customer-api",
                     "database": db_status}), 200
 

@@ -40,16 +40,4 @@ EXPOSE 5000
 # Switch to non-root
 USER appuser
 
-# Gunicorn:
-#   --workers 2        → 2 worker processes (tune to task CPU)
-#   --threads 2        → 2 threads per worker (handles slow DB queries)
-#   --timeout 60       → kill worker if it hangs for >60 s
-#   --access-logfile - → write access log to stdout (picked up by CloudWatch)
-CMD ["gunicorn", \
-     "--bind",            "0.0.0.0:5000", \
-     "--workers",         "2", \
-     "--threads",         "2", \
-     "--timeout",         "60", \
-     "--access-logfile",  "-", \
-     "--error-logfile",   "-", \
-     "app:app"]
+CMD ["waitress-serve", "--host=0.0.0.0", "--port=5000", "--threads=4", "app:app"]
